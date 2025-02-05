@@ -26,6 +26,7 @@
 
 #import "NSObject+FeatureNotSupported_Private.h"
 #import "NSMutableDictionary+NilSafe.h"
+#import "DLNAHTTPServer.h"
 
 #define kCastServiceMuteSubscriptionName @"mute"
 #define kCastServiceVolumeSubscriptionName @"volume"
@@ -34,7 +35,10 @@ static const NSInteger kSubtitleTrackIdentifier = 42;
 
 static NSString *const kSubtitleTrackDefaultLanguage = @"en";
 
-@interface CastService () <ServiceCommandDelegate, GCKMediaControlChannelDelegate>
+@interface CastService () <ServiceCommandDelegate, GCKMediaControlChannelDelegate> {
+    DLNAHTTPServer *_httpServer; // Use DLNAHTTPServer or a similar server
+    NSMutableDictionary *_httpServerSessionIds; // Manage subscriptions
+}
 
 @property (nonatomic, strong) MediaPlayStateSuccessBlock immediatePlayStateCallback;
 @property (nonatomic, strong) ServiceSubscription *playStateSubscription;
@@ -146,43 +150,93 @@ static NSString *const kSubtitleTrackDefaultLanguage = @"en";
 
 #pragma mark - Connection
 
-- (void)connect
-{
-    if (self.connected)
+- (void)connect {
+    if (self.connected) {
         return;
+    }
 
-    if (!_castDevice)
-    {
-        UInt32 devicePort = (UInt32) self.serviceDescription.port;
+    if (!_castDevice) {
+        UInt32 devicePort = (UInt32)self.serviceDescription.port;
         _castDevice = [[GCKDevice alloc] initWithIPAddress:self.serviceDescription.address servicePort:devicePort];
     }
-    
-    if (!_castDeviceManager)
-    {
+
+    if (!_castDeviceManager) {
         NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
         NSString *clientPackageName = [info objectForKey:@"CFBundleIdentifier"];
 
-        _castDeviceManager = [self createDeviceManagerWithDevice:_castDevice
-                                            andClientPackageName:clientPackageName];
+        _castDeviceManager = [self createDeviceManagerWithDevice:_castDevice andClientPackageName:clientPackageName];
         _castDeviceManager.delegate = self;
     }
-    
+
+    if (!_httpServer) {
+        _httpServer = [self createHTTPServer]; // Create and configure the HTTP server
+    }
+
+    [_httpServer start]; // Start the HTTP server
     [_castDeviceManager connect];
 }
 
-- (void)disconnect
-{
-    if (!self.connected)
+- (DLNAHTTPServer *)createHTTPServer {
+    DLNAHTTPServer *server = [DLNAHTTPServer new];
+    // Configure server if needed
+    return server;
+}
+
+- (void)disconnect {
+    if (!self.connected) {
         return;
+    }
 
     self.connected = NO;
 
     [_castDeviceManager leaveApplication];
     [_castDeviceManager disconnect];
 
-    if (self.delegate && [self.delegate respondsToSelector:@selector(deviceService:disconnectedWithError:)])
+    if (_httpServer) {
+        [_httpServer stop]; // Stop the HTTP server
+    }
+
+    if (self.delegate && [self.delegate respondsToSelector:@selector(deviceService:disconnectedWithError:)]) {
         dispatch_on_main(^{ [self.delegate deviceService:self disconnectedWithError:nil]; });
+    }
 }
+
+- (void)subscribeServices {
+    _httpServerSessionIds = [NSMutableDictionary new];
+
+    // Example subscription logic
+    NSString *eventPath = @"/cast-service-events";
+    NSString *serverPath = [[_httpServer getHostPath] stringByAppendingString:eventPath];
+    serverPath = [NSString stringWithFormat:@"<%@>", serverPath];
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:serverPath]];
+    [request setHTTPMethod:@"SUBSCRIBE"];
+    [request setValue:@"upnp:event" forHTTPHeaderField:@"NT"];
+    [request setValue:@"Second-300" forHTTPHeaderField:@"TIMEOUT"];
+
+    [NSURLConnection sendAsynchronousRequest:request queue:[NSOperationQueue mainQueue] completionHandler:^(NSURLResponse *_response, NSData *data, NSError *connectionError) {
+        if (!connectionError) {
+            NSString *sessionId = [(NSHTTPURLResponse *)_response allHeaderFields][@"SID"];
+            if (sessionId) {
+                _httpServerSessionIds[eventPath] = sessionId;
+            }
+        }
+    }];
+}
+
+- (void)unsubscribeServices {
+    [_httpServerSessionIds enumerateKeysAndObjectsUsingBlock:^(NSString *eventPath, NSString *sessionId, BOOL *stop) {
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:eventPath]];
+        [request setHTTPMethod:@"UNSUBSCRIBE"];
+        [request setValue:sessionId forHTTPHeaderField:@"SID"];
+
+        [NSURLConnection sendAsynchronousRequest:request queue:[NSOperationQueue mainQueue] completionHandler:nil];
+    }];
+
+    [_httpServerSessionIds removeAllObjects];
+}
+
+
 
 #pragma mark - Subscriptions
 
